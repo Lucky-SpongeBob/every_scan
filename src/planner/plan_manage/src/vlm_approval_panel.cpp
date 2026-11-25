@@ -208,9 +208,11 @@ void VlmApprovalPanel::odomCallback(
   std::lock_guard<std::mutex> guard(motion_mutex_);
   if (
     has_odom_ &&
-    now - last_odom_time_ > std::chrono::milliseconds(500))
+    now - last_odom_time_ > std::chrono::milliseconds(2000))
   {
     motion_samples_.clear();
+    motion_ready_ = false;
+    motion_state_candidate_ticks_ = 0;
   }
   has_odom_ = true;
   last_odom_time_ = now;
@@ -222,7 +224,6 @@ void VlmApprovalPanel::odomCallback(
     motion_samples_.pop_front();
   }
   if (motion_samples_.size() < 2) {
-    motion_ready_ = false;
     return;
   }
 
@@ -230,7 +231,6 @@ void VlmApprovalPanel::odomCallback(
   const double span = std::chrono::duration<double>(
     now - oldest.time).count();
   if (span < 0.7) {
-    motion_ready_ = false;
     return;
   }
   const double distance = std::hypot(
@@ -240,9 +240,15 @@ void VlmApprovalPanel::odomCallback(
     wrapAngle(sample.yaw - oldest.yaw));
   motion_speed_ = distance / span;
   motion_yaw_rate_ = yaw_change / span;
-  is_moving_ =
+  const bool candidate_moving =
     motion_speed_ > 0.03 ||
     motion_yaw_rate_ > 0.05;
+  if (candidate_moving == is_moving_) {
+    motion_state_candidate_ticks_ = 0;
+  } else if (++motion_state_candidate_ticks_ >= 2) {
+    is_moving_ = candidate_moving;
+    motion_state_candidate_ticks_ = 0;
+  }
   motion_ready_ = true;
 }
 
@@ -269,7 +275,7 @@ void VlmApprovalPanel::updateMotionLabel()
   QString text;
   if (
     !has_odom ||
-    now - last_odom_time > std::chrono::milliseconds(500))
+    now - last_odom_time > std::chrono::milliseconds(2000))
   {
     style_class = "unknown";
     text = "机械狗状态：状态未知（里程计超时）";

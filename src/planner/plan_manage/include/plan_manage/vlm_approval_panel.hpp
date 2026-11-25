@@ -76,6 +76,7 @@ private:
   bool has_odom_{false};
   bool motion_ready_{false};
   bool is_moving_{false};
+  int motion_state_candidate_ticks_{0};
   double motion_speed_{0.0};
   double motion_yaw_rate_{0.0};
   std::string motion_style_class_;
