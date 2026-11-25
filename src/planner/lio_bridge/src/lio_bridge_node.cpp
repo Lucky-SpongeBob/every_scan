@@ -1,0 +1,533 @@
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+#include "builtin_interfaces/msg/time.hpp"
+#include "geometry_msgs/msg/transform_stamped.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "tf2/LinearMath/Quaternion.h"
+#include "tf2/LinearMath/Vector3.h"
+#include "tf2_ros/transform_broadcaster.h"
+
+namespace lio_bridge
+{
+namespace
+{
+double stampSeconds(const builtin_interfaces::msg::Time & stamp)
+{
+  return static_cast<double>(stamp.sec) + static_cast<double>(stamp.nanosec) * 1e-9;
+}
+
+class VelocityEstimator
+{
+public:
+  VelocityEstimator(
+    double window_sec, double max_speed, double max_gap_sec, double deadband)
+  : window_sec_(window_sec),
+    max_speed_(max_speed),
+    max_gap_sec_(max_gap_sec),
+    deadband_(deadband)
+  {
+  }
+
+  void update(double stamp_sec, double x, double y, double z)
+  {
+    if (!samples_.empty()) {
+      const double dt = stamp_sec - samples_.back().stamp;
+      const double dx = x - samples_.back().x;
+      const double dy = y - samples_.back().y;
+      const double dz = z - samples_.back().z;
+      const double displacement = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+      // A timestamp gap or an impossible per-sample speed usually means a LIO
+      // reset/relocalization jump. Do not turn that discontinuity into velocity.
+      if (dt <= 0.0 || dt > max_gap_sec_ || displacement / dt > max_speed_) {
+        samples_.clear();
+        velocity_ = {0.0, 0.0, 0.0};
+      }
+    }
+
+    samples_.push_back({stamp_sec, x, y, z});
+    while (samples_.size() > 2 &&
+      samples_[1].stamp <= stamp_sec - window_sec_) {
+      samples_.pop_front();
+    }
+
+    if (samples_.size() < 2) {
+      velocity_ = {0.0, 0.0, 0.0};
+      return;
+    }
+
+    const double span = samples_.back().stamp - samples_.front().stamp;
+    if (span < 0.02) {
+      velocity_ = {0.0, 0.0, 0.0};
+      return;
+    }
+
+    velocity_[0] = (samples_.back().x - samples_.front().x) / span;
+    velocity_[1] = (samples_.back().y - samples_.front().y) / span;
+    velocity_[2] = (samples_.back().z - samples_.front().z) / span;
+
+    const double speed = speedNorm();
+    if (speed < deadband_) {
+      velocity_ = {0.0, 0.0, 0.0};
+      return;
+    }
+    if (speed > max_speed_) {
+      const double scale = max_speed_ / speed;
+      velocity_[0] *= scale;
+      velocity_[1] *= scale;
+      velocity_[2] *= scale;
+    }
+  }
+
+  const std::array<double, 3> & velocity() const { return velocity_; }
+  double speedNorm() const
+  {
+    return std::sqrt(
+      velocity_[0] * velocity_[0] + velocity_[1] * velocity_[1] +
+      velocity_[2] * velocity_[2]);
+  }
+
+private:
+  struct Sample
+  {
+    double stamp;
+    double x;
+    double y;
+    double z;
+  };
+
+  double window_sec_;
+  double max_speed_;
+  double max_gap_sec_;
+  double deadband_;
+  std::deque<Sample> samples_;
+  std::array<double, 3> velocity_{0.0, 0.0, 0.0};
+};
+}  // namespace
+
+class LioBridge : public rclcpp::Node
+{
+public:
+  LioBridge()
+  : Node("lio_bridge"),
+    velocity_estimator_(1.0, 2.0, 0.25, 0.12)
+  {
+    odom_topic_ = declare_parameter<std::string>("odom_topic", "/Odometry");
+    cloud_topic_ = declare_parameter<std::string>(
+        "cloud_topic", "/cloud_registered_body");
+    output_vehicle_topic_ = declare_parameter<std::string>(
+        "output_vehicle_topic", "/LIO/odom_vehicle");
+    output_imu_topic_ = declare_parameter<std::string>(
+        "output_imu_topic", "/LIO/odom_imu");
+    output_cloud_topic_ = declare_parameter<std::string>(
+        "output_cloud_topic", "/LIO/clouds_lidar");
+    cloud_min_z_ = declare_parameter<double>(
+        "cloud_min_z", -std::numeric_limits<double>::infinity());
+    cloud_max_z_ = declare_parameter<double>(
+        "cloud_max_z", std::numeric_limits<double>::infinity());
+    output_frame_id_ = declare_parameter<std::string>("output_frame_id", "world");
+    output_child_frame_id_ = declare_parameter<std::string>("output_child_frame_id", "base");
+    velocity_window_sec_ = declare_parameter<double>("velocity_window_sec", 1.0);
+    max_velocity_ = declare_parameter<double>("max_velocity", 2.0);
+    velocity_deadband_ = declare_parameter<double>("velocity_deadband", 0.12);
+    max_timestamp_gap_sec_ = declare_parameter<double>("max_timestamp_gap_sec", 0.25);
+    const auto alignment_x = declare_parameter<double>("world_alignment_x", 0.0);
+    const auto alignment_y = declare_parameter<double>("world_alignment_y", 0.0);
+    const auto alignment_z = declare_parameter<double>("world_alignment_z", 0.0);
+    const auto alignment_w = declare_parameter<double>("world_alignment_w", 1.0);
+    align_base_on_start_ = declare_parameter<bool>("align_base_on_start", true);
+
+    if (velocity_window_sec_ <= 0.0 || max_velocity_ <= 0.0 ||
+      velocity_deadband_ < 0.0 || velocity_deadband_ >= max_velocity_ ||
+      max_timestamp_gap_sec_ <= 0.0)
+    {
+      throw std::invalid_argument("velocity and timestamp-gap parameters must be positive");
+    }
+    if (cloud_min_z_ >= cloud_max_z_)
+      throw std::invalid_argument("cloud_min_z must be smaller than cloud_max_z");
+    world_alignment_ = tf2::Quaternion(
+      alignment_x, alignment_y, alignment_z, alignment_w);
+    if (!std::isfinite(world_alignment_.length()) || world_alignment_.length() < 1e-9) {
+      throw std::invalid_argument("world alignment quaternion must be finite and non-zero");
+    }
+    world_alignment_.normalize();
+    velocity_estimator_ = VelocityEstimator(
+      velocity_window_sec_, max_velocity_, max_timestamp_gap_sec_, velocity_deadband_);
+
+    // Keep the real-time bridge on the newest samples. Deep input queues
+    // accumulate stale LIO data when the transport is busy.
+    const auto odom_input_qos = rclcpp::QoS(rclcpp::KeepLast(2)).best_effort();
+    const auto cloud_input_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+    const auto odom_output_qos = rclcpp::QoS(rclcpp::KeepLast(20)).best_effort();
+    const auto cloud_output_qos = rclcpp::QoS(rclcpp::KeepLast(5)).best_effort();
+
+    odom_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+    cloud_callback_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+
+    rclcpp::SubscriptionOptions odom_options;
+    odom_options.callback_group = odom_callback_group_;
+    rclcpp::SubscriptionOptions cloud_options;
+    cloud_options.callback_group = cloud_callback_group_;
+
+    odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        odom_topic_, odom_input_qos,
+        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { onOdom(msg); },
+        odom_options);
+    cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+        cloud_topic_, cloud_input_qos,
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { onCloud(msg); },
+        cloud_options);
+
+    vehicle_pub_ = create_publisher<nav_msgs::msg::Odometry>(
+        output_vehicle_topic_, odom_output_qos);
+    imu_pub_ = create_publisher<nav_msgs::msg::Odometry>(
+        output_imu_topic_, odom_output_qos);
+    cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+        output_cloud_topic_, cloud_output_qos);
+
+    tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+    stats_timer_ = create_wall_timer(
+        std::chrono::seconds(1), [this]() { logStats(); });
+
+    RCLCPP_INFO(
+        get_logger(),
+        "LIO bridge ready: odom=%s, cloud=%s, output frame=%s child=%s, "
+        "world alignment=(%.6f, %.6f, %.6f, %.6f)",
+        odom_topic_.c_str(), cloud_topic_.c_str(),
+        output_frame_id_.c_str(), output_child_frame_id_.c_str(),
+        world_alignment_.x(), world_alignment_.y(), world_alignment_.z(),
+        world_alignment_.w());
+  }
+
+private:
+  void fillOutputOdometry(
+    const nav_msgs::msg::Odometry & input,
+    nav_msgs::msg::Odometry & output) const
+  {
+    output = input;
+    output.header.frame_id = output_frame_id_;
+    output.child_frame_id = output_child_frame_id_;
+
+    tf2::Quaternion input_rotation(
+      input.pose.pose.orientation.x, input.pose.pose.orientation.y,
+      input.pose.pose.orientation.z, input.pose.pose.orientation.w);
+    if (input_rotation.length() < 1e-9) {
+      throw std::runtime_error("input odometry quaternion is zero");
+    }
+    input_rotation.normalize();
+
+    const tf2::Vector3 input_position(
+      input.pose.pose.position.x, input.pose.pose.position.y,
+      input.pose.pose.position.z);
+    const auto aligned_position = tf2::quatRotate(world_alignment_, input_position);
+    auto aligned_rotation = world_alignment_ * input_rotation;
+    aligned_rotation.normalize();
+
+    output.pose.pose.position.x = aligned_position.x();
+    output.pose.pose.position.y = aligned_position.y();
+    output.pose.pose.position.z = aligned_position.z();
+    output.pose.pose.orientation.x = aligned_rotation.x();
+    output.pose.pose.orientation.y = aligned_rotation.y();
+    output.pose.pose.orientation.z = aligned_rotation.z();
+    output.pose.pose.orientation.w = aligned_rotation.w();
+
+    const auto & velocity = velocity_estimator_.velocity();
+    output.twist.twist.linear.x = velocity[0];
+    output.twist.twist.linear.y = velocity[1];
+    output.twist.twist.linear.z = velocity[2];
+  }
+
+  void fillVehicleOdometry(
+    const nav_msgs::msg::Odometry & sensor_output,
+    const tf2::Quaternion & imu_to_base,
+    nav_msgs::msg::Odometry & output) const
+  {
+    output = sensor_output;
+
+    tf2::Quaternion sensor_rotation(
+      sensor_output.pose.pose.orientation.x, sensor_output.pose.pose.orientation.y,
+      sensor_output.pose.pose.orientation.z, sensor_output.pose.pose.orientation.w);
+    auto base_rotation = sensor_rotation * imu_to_base;
+    base_rotation.normalize();
+
+    output.pose.pose.orientation.x = base_rotation.x();
+    output.pose.pose.orientation.y = base_rotation.y();
+    output.pose.pose.orientation.z = base_rotation.z();
+    output.pose.pose.orientation.w = base_rotation.w();
+  }
+
+  void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr & msg)
+  {
+    odom_rx_.fetch_add(1, std::memory_order_relaxed);
+    if (!odom_seen_.exchange(true, std::memory_order_relaxed)) {
+      RCLCPP_INFO(
+          get_logger(), "odom input frame=%s child=%s",
+          msg->header.frame_id.c_str(), msg->child_frame_id.c_str());
+    }
+
+    double stamp = stampSeconds(msg->header.stamp);
+    if (stamp <= 0.0) stamp = now().seconds();
+    velocity_estimator_.update(
+      stamp, msg->pose.pose.position.x, msg->pose.pose.position.y,
+      msg->pose.pose.position.z);
+
+    nav_msgs::msg::Odometry sensor_output;
+    fillOutputOdometry(*msg, sensor_output);
+
+    tf2::Quaternion sensor_rotation(
+      sensor_output.pose.pose.orientation.x, sensor_output.pose.pose.orientation.y,
+      sensor_output.pose.pose.orientation.z, sensor_output.pose.pose.orientation.w);
+    tf2::Quaternion imu_to_base;
+    {
+      std::lock_guard<std::mutex> lock(base_alignment_mutex_);
+      if (!base_alignment_ready_) {
+        imu_to_base_ = align_base_on_start_ ?
+          sensor_rotation.inverse() : tf2::Quaternion::getIdentity();
+        imu_to_base_.normalize();
+        base_alignment_ready_ = true;
+        RCLCPP_INFO(
+          get_logger(), "IMU-to-base alignment=(%.6f, %.6f, %.6f, %.6f)",
+          imu_to_base_.x(), imu_to_base_.y(), imu_to_base_.z(), imu_to_base_.w());
+      }
+      imu_to_base = imu_to_base_;
+    }
+
+    nav_msgs::msg::Odometry vehicle_output;
+    fillVehicleOdometry(sensor_output, imu_to_base, vehicle_output);
+    vehicle_pub_->publish(vehicle_output);
+    imu_pub_->publish(sensor_output);
+    velocity_norm_.store(velocity_estimator_.speedNorm());
+    odom_vehicle_tx_.fetch_add(1, std::memory_order_relaxed);
+    odom_imu_tx_.fetch_add(1, std::memory_order_relaxed);
+    broadcastOdometryTransform(
+      vehicle_output, imu_to_base.inverse(), sensor_output.header.stamp, stamp);
+  }
+
+  void broadcastOdometryTransform(
+    const nav_msgs::msg::Odometry & odom,
+    const tf2::Quaternion & base_to_body,
+    const builtin_interfaces::msg::Time & header_stamp,
+    double stamp_sec)
+  {
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header.frame_id = output_frame_id_;
+    transform.child_frame_id = output_child_frame_id_;
+    transform.header.stamp = header_stamp;
+    if (stamp_sec <= 0.0) {
+      transform.header.stamp = now();
+    }
+    transform.transform.translation.x = odom.pose.pose.position.x;
+    transform.transform.translation.y = odom.pose.pose.position.y;
+    transform.transform.translation.z = odom.pose.pose.position.z;
+    transform.transform.rotation = odom.pose.pose.orientation;
+    std::vector<geometry_msgs::msg::TransformStamped> transforms{transform};
+    if (output_child_frame_id_ != "body") {
+      auto sensor_transform = transform;
+      sensor_transform.header.frame_id = output_child_frame_id_;
+      sensor_transform.child_frame_id = "body";
+      sensor_transform.transform = geometry_msgs::msg::Transform();
+      sensor_transform.transform.rotation.x = base_to_body.x();
+      sensor_transform.transform.rotation.y = base_to_body.y();
+      sensor_transform.transform.rotation.z = base_to_body.z();
+      sensor_transform.transform.rotation.w = base_to_body.w();
+      transforms.push_back(sensor_transform);
+    }
+    tf_broadcaster_->sendTransform(transforms);
+  }
+
+  void onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg)
+  {
+    sensor_msgs::msg::PointCloud2 filtered;
+    const sensor_msgs::msg::PointCloud2 * output = msg.get();
+    if (std::isfinite(cloud_max_z_) || std::isfinite(cloud_min_z_)) {
+      filtered = filterCloudByZ(*msg, cloud_min_z_, cloud_max_z_);
+      output = &filtered;
+    }
+
+    const uint64_t point_count =
+        static_cast<uint64_t>(output->width) * output->height;
+    cloud_rx_.fetch_add(1, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      cloud_frame_ = output->header.frame_id;
+      cloud_points_ = point_count;
+    }
+    if (!cloud_seen_.exchange(true, std::memory_order_relaxed)) {
+      RCLCPP_INFO(
+          get_logger(), "cloud input frame=%s points=%llu",
+          output->header.frame_id.c_str(), static_cast<unsigned long long>(point_count));
+    }
+    cloud_pub_->publish(*output);
+    cloud_tx_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static bool hasField(
+      const sensor_msgs::msg::PointCloud2 & msg,
+      const std::string & name)
+  {
+    for (const auto & field : msg.fields) {
+      if (field.name == name)
+        return true;
+    }
+    return false;
+  }
+
+  static sensor_msgs::msg::PointCloud2 filterCloudByZ(
+      const sensor_msgs::msg::PointCloud2 & input,
+      double min_z,
+      double max_z)
+  {
+    if (!hasField(input, "x") || !hasField(input, "y") || !hasField(input, "z")) {
+      return input;
+    }
+
+    std::vector<std::array<float, 4>> points;
+    points.reserve(static_cast<size_t>(input.width) * input.height);
+    const bool has_intensity = hasField(input, "intensity");
+    try {
+      sensor_msgs::PointCloud2ConstIterator<float> x(input, "x");
+      sensor_msgs::PointCloud2ConstIterator<float> y(input, "y");
+      sensor_msgs::PointCloud2ConstIterator<float> z(input, "z");
+      if (has_intensity) {
+        sensor_msgs::PointCloud2ConstIterator<float> intensity(input, "intensity");
+        for (; x != x.end(); ++x, ++y, ++z, ++intensity) {
+          if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z) ||
+              *z < min_z || *z > max_z)
+            continue;
+          points.push_back({*x, *y, *z, *intensity});
+        }
+      } else {
+        for (; x != x.end(); ++x, ++y, ++z) {
+          if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z) ||
+              *z < min_z || *z > max_z)
+            continue;
+          points.push_back({*x, *y, *z, 0.0f});
+        }
+      }
+    } catch (const std::exception &) {
+      return input;
+    }
+
+    sensor_msgs::msg::PointCloud2 output;
+    output.header = input.header;
+    sensor_msgs::PointCloud2Modifier modifier(output);
+    modifier.setPointCloud2Fields(
+        4,
+        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "intensity", 1, sensor_msgs::msg::PointField::FLOAT32);
+    modifier.resize(points.size());
+    sensor_msgs::PointCloud2Iterator<float> ox(output, "x");
+    sensor_msgs::PointCloud2Iterator<float> oy(output, "y");
+    sensor_msgs::PointCloud2Iterator<float> oz(output, "z");
+    sensor_msgs::PointCloud2Iterator<float> oi(output, "intensity");
+    for (const auto & point : points) {
+      *ox = point[0];
+      *oy = point[1];
+      *oz = point[2];
+      *oi = point[3];
+      ++ox;
+      ++oy;
+      ++oz;
+      ++oi;
+    }
+    return output;
+  }
+
+  void logStats()
+  {
+    const auto odom = odom_rx_.exchange(0, std::memory_order_relaxed);
+    const auto cloud = cloud_rx_.exchange(0, std::memory_order_relaxed);
+    const auto vehicle_tx = odom_vehicle_tx_.exchange(0, std::memory_order_relaxed);
+    const auto imu_tx = odom_imu_tx_.exchange(0, std::memory_order_relaxed);
+    const auto cloud_tx = cloud_tx_.exchange(0, std::memory_order_relaxed);
+
+    std::string cloud_frame;
+    uint64_t cloud_points = 0;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      cloud_frame = cloud_frame_;
+      cloud_points = cloud_points_;
+    }
+
+    RCLCPP_INFO(
+        get_logger(),
+        "rx/s odom=%llu cloud=%llu | tx/s vehicle=%llu imu=%llu cloud=%llu | "
+        "cloud_frame=%s points=%llu",
+        static_cast<unsigned long long>(odom), static_cast<unsigned long long>(cloud),
+        static_cast<unsigned long long>(vehicle_tx), static_cast<unsigned long long>(imu_tx),
+        static_cast<unsigned long long>(cloud_tx), cloud_frame.c_str(),
+        static_cast<unsigned long long>(cloud_points));
+    RCLCPP_INFO(
+        get_logger(), "velocity estimate: %.3f m/s", velocity_norm_.load());
+  }
+
+  std::string odom_topic_;
+  std::string cloud_topic_;
+  std::string output_vehicle_topic_;
+  std::string output_imu_topic_;
+  std::string output_cloud_topic_;
+  double cloud_min_z_;
+  double cloud_max_z_;
+  std::string output_frame_id_;
+  std::string output_child_frame_id_;
+  double velocity_window_sec_;
+  double max_velocity_;
+  double velocity_deadband_;
+  double max_timestamp_gap_sec_;
+  tf2::Quaternion world_alignment_;
+  bool align_base_on_start_;
+  tf2::Quaternion imu_to_base_;
+  bool base_alignment_ready_ = false;
+  std::mutex base_alignment_mutex_;
+  VelocityEstimator velocity_estimator_;
+
+  rclcpp::CallbackGroup::SharedPtr odom_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr cloud_callback_group_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr vehicle_pub_;
+  rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr imu_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  rclcpp::TimerBase::SharedPtr stats_timer_;
+
+  std::atomic<uint64_t> odom_rx_{0};
+  std::atomic<uint64_t> cloud_rx_{0};
+  std::atomic<uint64_t> odom_vehicle_tx_{0};
+  std::atomic<uint64_t> odom_imu_tx_{0};
+  std::atomic<uint64_t> cloud_tx_{0};
+  std::atomic<double> velocity_norm_{0.0};
+  std::atomic<bool> odom_seen_{false};
+  std::atomic<bool> cloud_seen_{false};
+  std::mutex state_mutex_;
+  std::string cloud_frame_;
+  uint64_t cloud_points_ = 0;
+};
+}  // namespace lio_bridge
+
+int main(int argc, char ** argv)
+{
+  rclcpp::init(argc, argv);
+  auto node = std::make_shared<lio_bridge::LioBridge>();
+  rclcpp::executors::MultiThreadedExecutor executor;
+  executor.add_node(node);
+  executor.spin();
+  rclcpp::shutdown();
+  return 0;
+}

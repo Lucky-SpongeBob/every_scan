@@ -1,35 +1,69 @@
-build
+# ROS 2 / colcon build products
+/build/
+/install/
+/log/
+/devel/
+/.colcon/
+/compile_commands.json
+/thirdparty/glm/
 
-devel
-
-install
-
+# ROS runtime state
+/.ros/
 /maps/
+/map.pcd
+*.bag
+*.db3
+*.mcap
 
-log/*
+# Local perception models and runtime environments
+/perception/.venv/
+/perception/vlm_py/
+/perception/models/
+/perception/*.onnx
+/perception/*.pt
+/perception/*.pth
+/perception/*.safetensors
+/perception/*.engine
+/perception/data/
+/perception/wheels/
+/perception/yolo_trt/build/
+/perception/clip_trt/build/
 
-.catkin_workspace
-
-__pycache__
-
+# Python cache and test output
+__pycache__/
 *.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
 
-.~lock.*#
-
-*.rviz.bak-*
-
+# Editor and operating-system files
+/.vscode/
+/.idea/
+*.swp
+*.swo
 *~
-
 .DS_Store
+Thumbs.db
 
-.vscode
+# Local credentials
+.env
+.env.*
+*.pem
+*.key
 
-src/base_autonomy/vehicle_simulator/mesh/*
+# Locally copied legacy dependencies. The ROS 2 build uses system GLFW, GLEW,
+# OpenGL and GLM packages instead; see README.md for installation commands.
+/src/simulator/local_sensing/third_party/
+/src/simulator/local_sensing/include/GL/
+/src/simulator/local_sensing/include/glad/
+/src/simulator/local_sensing/include/glad.c
+/src/simulator/local_sensing/include/glm/
 
-!src/base_autonomy/vehicle_simulator/mesh/unity
-
-src/base_autonomy/vehicle_simulator/mesh/unity/*
-
-src/base_autonomy/vehicle_simulator/log/*
-
-!readme.txt
+# Native build artifacts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
